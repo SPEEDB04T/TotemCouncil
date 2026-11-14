@@ -39,6 +39,9 @@ local toast, toastQueue = nil, {}
 local function NextToast()
     if not toast or toast:IsShown() then return end
     local req = table.remove(toastQueue, 1)
+    while req and req.valid and not req.valid() do   -- skip requests that no longer apply
+        req = table.remove(toastQueue, 1)
+    end
     if not req then return end
     toast.req = req
     toast.text:SetText(req.text or "")
@@ -50,6 +53,7 @@ local function NextToast()
     end
     toast:SetHeight(math.max(74, (toast.text:GetStringHeight() or 30) + 54))
     toast.left = 45
+    toast.shownAt = GetTime()
     toast:Show()
 end
 
@@ -82,7 +86,12 @@ local function CreateToast()
     toast.text:SetTextColor(0.85, 0.85, 0.85)
     toast.accept = MakeButton(toast, "Accept", 90)
     toast.accept:SetPoint("BOTTOMRIGHT", toast, "BOTTOM", -4, 10)
-    toast.accept:SetScript("OnClick", function() CloseToast("y") end)
+    toast.accept:SetScript("OnClick", function()
+        -- a request that only just appeared can't be accepted yet, so a
+        -- double-click on the one before it does not accept this one unread
+        if GetTime() - (toast.shownAt or 0) < 0.6 then return end
+        CloseToast("y")
+    end)
     toast.decline = MakeButton(toast, "Decline", 90)
     toast.decline:SetPoint("BOTTOMLEFT", toast, "BOTTOM", 4, 10)
     toast.decline:SetScript("OnClick", function() CloseToast("n") end)
@@ -94,9 +103,12 @@ local function CreateToast()
     toast:Hide()
 end
 
--- req = { text, icon, onAccept, onDecline }
+-- req = { text, icon, onAccept, onDecline, valid }
+-- At most six wait their turn; more than that is dropped unanswered (the
+-- sender's request simply runs out).
 function Board.Toast(req)
     if not toast then CreateToast() end
+    if #toastQueue >= 6 then return end
     toastQueue[#toastQueue + 1] = req
     NextToast()
 end
@@ -254,7 +266,7 @@ function Board.Create()
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:AddLine("Sort it out")
         GameTooltip:AddLine("Works out a plan with no totem dropped twice in one group and sends it to every shaman with Totem Council. Each one accepts or declines their own change.", 1, 1, 1, true)
-        GameTooltip:AddLine("Shamans without the addon keep their totems; otherwise the one earlier in the alphabet keeps theirs and the other moves to their next best free totem.", 0.6, 0.6, 0.6, true)
+        GameTooltip:AddLine("Shamans without the addon keep their totems; otherwise the one earlier in the alphabet keeps theirs and the other moves to the first free totem in their menu.", 0.6, 0.6, 0.6, true)
         GameTooltip:Show()
     end)
     frame.resolve:SetScript("OnLeave", function() GameTooltip:Hide() end)

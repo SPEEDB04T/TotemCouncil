@@ -68,10 +68,13 @@ local function Create()
             if self.away > 1.2 then Close() end
         end
     end)
-    -- and at once on a click anywhere else
+    -- and at once on a click anywhere else (a click on the icon it belongs to
+    -- is left to that icon, which closes or re-opens the menu itself)
     pcall(frame.RegisterEvent, frame, "GLOBAL_MOUSE_DOWN")
     frame:SetScript("OnEvent", function(self)
-        if self:IsShown() and not self:IsMouseOver() then Close() end
+        if not self:IsShown() or self:IsMouseOver() then return end
+        if self.anchor and self.anchor.IsMouseOver and self.anchor:IsMouseOver() then return end
+        Close()
     end)
     if type(UISpecialFrames) == "table" then table.insert(UISpecialFrames, "TotemCouncilMenu") end
     frame:Hide()
@@ -128,12 +131,18 @@ function Menu.Open(anchor, items)
     frame:SetPoint("BOTTOMLEFT", anchor, "TOPLEFT", 0, 4)
     frame.anchor = anchor
     frame.away = 0
+    if GameTooltip and GameTooltip.Hide then GameTooltip:Hide() end   -- it would sit on top of the list
     frame:Show()
 end
 
 -- The "which totem for this element" list, shared by the bar and the plan window.
 -- member = whose totem is being picked; picking for someone else sends a suggestion.
 function Menu.OpenTotems(anchor, member, slot)
+    -- clicking the icon the menu is already open for closes it
+    if frame and frame:IsShown() and frame.anchor == anchor then
+        Close()
+        return
+    end
     local G = ns.Group
     local el = ns.ELEMENTS[slot]
     local own = member.isPlayer
@@ -167,7 +176,7 @@ function Menu.OpenTotems(anchor, member, slot)
     end
     if own then
         items[#items + 1] = {
-            text = "Nothing", checked = (current == nil),
+            text = "No totem planned", checked = (current == nil),
             func = function() ns.SetPlan(slot, nil) end,
         }
         items[#items + 1] = { separator = true }

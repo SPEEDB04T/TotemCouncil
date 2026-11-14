@@ -12,6 +12,7 @@ local PREFIX = "TotemCouncil"
 
 G.members = {}      -- [name] = { name, unit, subgroup, isPlayer, hasAddon, version, plan, known, seen, habit, demo }
 G.byUnit = {}       -- unit token -> name, for every group member
+G.names = {}        -- [name] = true for every group member of any class (who may send us messages)
 G.pending = {}      -- suggestions this player sent: [id] = { target, slot, key, time }
 G.proposal = nil    -- { id, from, lines = { [name] = plan }, votes = { [name] = "y"/"n" }, time, mine, answered, doneAt }
 G.conflictMap = {}  -- [name][slot] = { other names planning the same totem }
@@ -180,13 +181,14 @@ end
 
 function G.Rebuild()
     local old = G.members
-    local members, byUnit = {}, {}
+    local members, byUnit, names = {}, {}, {}
     local hadOthers = G.OtherShamans()
 
     local function add(name, unit, subgroup, class)
         name = Norm(name)
         if not name then return end
         byUnit[unit] = name
+        names[name] = true
         if class ~= "SHAMAN" then return end
         local m = members[name] or old[name] or NewMember(name)
         m.unit = unit
@@ -247,7 +249,7 @@ function G.Rebuild()
         members[thok.name] = thok
     end
 
-    G.members, G.byUnit = members, byUnit
+    G.members, G.byUnit, G.names = members, byUnit, names
     if G.OtherShamans() > hadOthers then
         -- someone new: ask for their plan and send ours
         G.wantRequest = true
@@ -285,6 +287,16 @@ function G.ObserveCast(unit, spellID)
     G.Touch()
 end
 
+-- Is this shaman close enough for their totem to matter to the player? The
+-- game's own range check is wider than a totem, so it only rules out the
+-- clearly far away. Anything it can't tell counts as near.
+local function Near(m)
+    if m.demo or not m.unit or not UnitInRange then return true end
+    local ok, inRange, checked = pcall(UnitInRange, m.unit)
+    if not ok or issecret(inRange) or issecret(checked) or not checked then return true end
+    return inRange and true or false
+end
+
 -- Names of subgroup mates who have the same totem down as the player right now.
 function G.Overlaps(slot)
     local a = ns.active[slot]
@@ -297,7 +309,7 @@ function G.Overlaps(slot)
     for name, m in pairs(G.members) do
         if not m.isPlayer and m.subgroup == me.subgroup then
             local s = m.seen[slot]
-            if s and s.key == a.key and s.expires > now then
+            if s and s.key == a.key and s.expires > now and Near(m) then
                 out = out or {}
                 out[#out + 1] = name
             end
@@ -354,6 +366,9 @@ local function StateMessage()
 end
 
 -- One message a second at most: the state first, then whatever is queued.
+-- The state never goes twice in a row while replies wait, so someone asking
+-- for it over and over can't hold them back.
+local lastKind, sendErrors = nil, 0
 local function Flush()
     local channel = AddonChannel()
     if not channel then
@@ -369,7 +384,7 @@ local function Flush()
     local msg, kind
     if G.wantRequest then
         msg, kind = "Q", "request"
-    elseif G.stateDirty and ns.isShaman then
+    elseif G.stateDirty and ns.isShaman and not (lastKind == "state" and #queue > 0) then
         msg, kind = StateMessage(), "state"
     elseif #queue > 0 then
         msg, kind = queue[1], "queue"
@@ -378,8 +393,17 @@ local function Flush()
         return
     end
     local ok, result = pcall(C_ChatInfo.SendAddonMessage, PREFIX, msg, channel)
-    local sent = ok and not (type(result) == "number" and result ~= 0) and result ~= false
-    if not sent then return end     -- throttled or refused: try again next second
+    if not ok then
+        -- the game rejects this very message (too long, malformed): after a few
+        -- tries give up on it, so everything behind it is not stuck for good
+        sendErrors = sendErrors + 1
+        if sendErrors < 3 then return end
+    else
+        local sent = not (type(result) == "number" and result ~= 0) and result ~= false
+        if not sent then return end     -- throttled or refused: try again next second
+    end
+    sendErrors = 0
+    lastKind = kind
     if kind == "request" then
         G.wantRequest = false
     elseif kind == "state" then
@@ -427,14 +451,22 @@ function G.Suggest(targetName, slot, key)
     ns.Print(("suggested %s to %s."):format(info.name, targetName))
 end
 
+local lastUnknown = {}   -- [sender] = when they last suggested a totem the player can't cast
+
 local function OnSuggestion(from, id, target, letter, key)
     if not ns.isShaman or Norm(target) ~= ns.playerName then return end
     local slot = slotByLetter[letter or ""]
     local info = slot and ns.ValidKey(key, slot) and ns.Info(key)
     if not info or not id then return end
     if not ns.Known(key) then
+        -- answered at most once per sender every 10 seconds, and not in chat mid-fight
+        local now = GetTime()
+        if now - (lastUnknown[from] or -99) < 10 then return end
+        lastUnknown[from] = now
         Enqueue("R;" .. id .. ";n")
-        ns.Print(("%s suggested %s, which you don't know."):format(from, info.name))
+        if not ns.inCombat then
+            ns.Print(("%s suggested %s, which you don't know."):format(from, info.name))
+        end
         return
     end
     if ns.cdb.plan[slot] == key then
@@ -521,38 +553,55 @@ function G.Resolve()
     return lines, stuck
 end
 
-local function ApplyLine(line)
+-- only = { [slot] = true }: touch just these slots (nil = all four).
+local function ApplyLine(line, only)
     for slot = 1, 4 do
-        local key = line[slot]
-        if key and not (ns.ValidKey(key, slot) and ns.Known(key)) then key = nil end
-        ns.cdb.plan[slot] = key
+        if not only or only[slot] then
+            local key = line[slot]
+            if key and not (ns.ValidKey(key, slot) and ns.Known(key)) then key = nil end
+            ns.cdb.plan[slot] = key
+        end
     end
     ns.HUD.ApplySecure()
     G.BroadcastState()
 end
 
+-- What accepting a line would change for the player: the text for the pop-up
+-- and the slots it touches. A totem the player can't cast counts as "nothing",
+-- exactly as ApplyLine treats it.
 local function DescribeLine(line)
-    local parts = {}
+    local parts, slots = {}, {}
     for _, slot in ipairs(ns.SLOT_ORDER) do
         local old, new = ns.cdb.plan[slot], line[slot]
+        if new and not (ns.ValidKey(new, slot) and ns.Known(new)) then new = nil end
         if old ~= new then
+            slots[slot] = true
             local oi, ni = old and ns.Info(old), new and ns.Info(new)
             parts[#parts + 1] = ("%s: %s -> |cffffffff%s|r"):format(ns.ELEMENTS[slot].name,
                 oi and oi.short or "nothing", ni and ni.short or "nothing")
         end
     end
-    return parts
+    return parts, slots
+end
+
+-- yes, no, total over the shamans a proposal asks; those who left the group no longer count.
+local function Tally(prop)
+    local yes, no, total = 0, 0, 0
+    for name in pairs(prop.lines) do
+        if G.members[name] then
+            total = total + 1
+            if prop.votes[name] == "y" then yes = yes + 1 elseif prop.votes[name] == "n" then no = no + 1 end
+        end
+    end
+    return yes, no, total
 end
 
 local function ProposalCheckDone(prop)
     if prop.doneAt then return end
-    local yes, no, total = 0, 0, 0
-    for name in pairs(prop.lines) do
-        total = total + 1
-        if prop.votes[name] == "y" then yes = yes + 1 elseif prop.votes[name] == "n" then no = no + 1 end
-    end
+    local yes, no, total = Tally(prop)
     if yes + no < total then return end
     prop.doneAt = GetTime()
+    if total == 0 then return end
     if no == 0 then
         ns.Print("totem plan agreed by everyone.")
     else
@@ -564,11 +613,7 @@ end
 function G.ProposalProgress()
     local prop = G.proposal
     if not prop then return nil end
-    local yes, no, total = 0, 0, 0
-    for name in pairs(prop.lines) do
-        total = total + 1
-        if prop.votes[name] == "y" then yes = yes + 1 elseif prop.votes[name] == "n" then no = no + 1 end
-    end
+    local yes, no, total = Tally(prop)
     return yes, total, no
 end
 
@@ -635,11 +680,13 @@ local function OnProposal(from, fields)
     if not prop or prop.id ~= id then
         prop = { id = id, from = from, lines = {}, votes = {}, time = GetTime() }
         G.proposal = prop
+    elseif prop.from ~= from then
+        return      -- only the proposer can add to their own proposal
     end
     for i = 3, #fields do
         local name, plan = fields[i]:match("^(.-)=(.*)$")
         name = Norm(name)
-        if name then
+        if name and G.members[name] then
             prop.lines[name] = DecodePlan(plan)
             if name == from then prop.votes[name] = "y" end
         end
@@ -647,15 +694,21 @@ local function OnProposal(from, fields)
     local mine = prop.lines[ns.playerName]
     if mine and ns.isShaman and not prop.answered then
         prop.answered = true
-        local parts = DescribeLine(mine)
+        local parts, slots = DescribeLine(mine)
         if #parts == 0 then
             prop.votes[ns.playerName] = "y"
             Enqueue("V;" .. id .. ";y")
         else
             ns.Board.Toast({
                 text = ("|cffffd200%s|r proposes a group totem plan. Your part:\n%s"):format(from, table.concat(parts, "\n")),
+                -- a proposal that was replaced or ran out is not asked about any more
+                valid = function() return G.proposal == prop end,
                 onAccept = function()
-                    ApplyLine(mine)
+                    if G.proposal ~= prop then
+                        ns.Print("that proposal is out of date. Ask for a new one if it is still needed.")
+                        return
+                    end
+                    ApplyLine(mine, slots)      -- only what the pop-up showed
                     prop.votes[ns.playerName] = "y"
                     Enqueue("V;" .. id .. ";y")
                     ProposalCheckDone(prop)
@@ -689,12 +742,14 @@ function G.OnAddonMessage(prefix, text, channel, sender)
     if prefix ~= PREFIX or type(text) ~= "string" then return end
     local from = Norm(sender)
     if not from or from == ns.playerName then return end
+    if not G.names[from] then return end    -- only people in the group are listened to
     local f = Split(text, ";")
     local kind = f[1]
     if kind == "S" then
         local m = G.members[from]
         if not m then return end
-        m.hasAddon, m.version = true, f[2]
+        -- the version ends up in chat (/totems status): keep it to plain characters
+        m.hasAddon, m.version = true, (tostring(f[2] or ""):gsub("[^%w%._%-]", "")):sub(1, 12)
         m.plan = DecodePlan(f[3])
         m.known = {}
         for _, key in ipairs(Split(f[4] or "", ".")) do
@@ -735,7 +790,10 @@ function G.Announce()
                 local info = ns.Info(G.Effective(m, slot))
                 parts[#parts + 1] = info and info.short or "-"
             end
-            local ok = pcall(send, ("Totems - %s: %s"):format(m.name, table.concat(parts, " / ")), channel)
+            -- a non-shaman posts every party, so each line says which one
+            local who = m.name
+            if channel == "RAID" and not me then who = ("%s (group %d)"):format(who, m.subgroup) end
+            local ok = pcall(send, ("Totems - %s: %s"):format(who, table.concat(parts, " / ")), channel)
             if ok then sent = sent + 1 end
         end
     end
@@ -773,7 +831,15 @@ function G.Tick(now)
             ProposalCheckDone(prop)
             changed = true
         end
+        if not prop.doneAt then
+            ProposalCheckDone(prop)     -- someone still being waited for may have left the group
+            if prop.doneAt then changed = true end
+        end
         if (prop.doneAt and now - prop.doneAt > 8) or now - prop.time > 120 then
+            if prop.mine and not prop.doneAt then
+                local yes, _, total = Tally(prop)
+                ns.Print(("your totem proposal ran out of time: %d of %d accepted."):format(yes, total))
+            end
             G.proposal = nil
             changed = true
         end

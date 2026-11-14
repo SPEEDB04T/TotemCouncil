@@ -2,7 +2,7 @@
 local ADDON, ns = ...
 
 ns.ADDON = ADDON
-ns.VERSION = "1.0.0"
+ns.VERSION = "1.0.1"
 
 -- WoW Forever hides some values from addons in combat ("secret values").
 -- Comparing or indexing one throws, so every API result is checked first.
@@ -123,9 +123,12 @@ end
 ----------------------------------------------------------------------
 local byID, byName = {}, {}
 local mapsBuilt, mapsLocalized = false, false
+local nextBuild = 0
 
 local function BuildMaps()
-    if mapsBuilt and mapsLocalized then return end
+    -- while some spell names are still missing, look again every few seconds, not on every lookup
+    if mapsBuilt and (mapsLocalized or GetTime() < nextBuild) then return end
+    nextBuild = GetTime() + 5
     local allLocalized = true
     for key, def in pairs(ns.TOTEMS) do
         for _, id in ipairs(def.ids) do byID[id] = key end
@@ -263,9 +266,11 @@ function ns.Known(key)
             result = { spellID = id or knownID, name = name or info.name, icon = icon or info.icon }
         end
     else
+        -- only totems learned from the player's own totem slot count; a "#id"
+        -- key made up by someone else must never become something to cast
         local id = LearnedID(key)
         local info = id and ns.Info(key)
-        if info and PlayerKnows(id) ~= false then
+        if info and ns.db and ns.db.learned[id] and PlayerKnows(id) ~= false then
             result = { spellID = id, name = info.name, icon = info.icon }
         end
     end
@@ -297,7 +302,8 @@ function ns.Duration(key, spellID)
     local d = ns.db and ns.db.durations
     if d then
         if spellID and d[spellID] then return d[spellID] end
-        if key and d[key] then return d[key] end
+        -- totems whose ranks last different times (Searing) use the per-rank table below
+        if key and d[key] and not (ns.TOTEMS[key] and ns.TOTEMS[key].durs) then return d[key] end
     end
     local def = key and ns.TOTEMS[key]
     if def then

@@ -68,8 +68,15 @@ local function OnEnter(self)
         GameTooltip:AddLine("Same plan as " .. JoinNames(st.conflict) .. ". Open the group plan to sort it out.", ORANGE[1], ORANGE[2], ORANGE[3], true)
     end
     GameTooltip:AddLine(" ")
-    if planInfo and ns.db.clickCast then
-        GameTooltip:AddLine("Left-click: drop " .. planInfo.name, 0.5, 0.8, 1)
+    -- say what the click really does: in combat the button keeps the totem it
+    -- had when the fight started
+    local bound = self:GetAttribute("type1") == "spell" and self:GetAttribute("spell1") or nil
+    local known = ns.db.clickCast and st.plan and ns.Known(st.plan) or nil
+    local want = known and known.name or nil
+    if bound then GameTooltip:AddLine("Left-click: drop " .. bound, 0.5, 0.8, 1) end
+    if bound ~= want and InCombatLockdown() then
+        GameTooltip:AddLine(want and ("Left-click changes to " .. want .. " after combat") or "Left-click turns off after combat",
+            ORANGE[1], ORANGE[2], ORANGE[3], true)
     end
     GameTooltip:AddLine("Right-click: choose the totem to keep up", 0.5, 0.8, 1)
     if not ns.db.locked then GameTooltip:AddLine("Drag: move the bar (/totems lock)", 0.5, 0.5, 0.5) end
@@ -186,9 +193,13 @@ local function CreateButton(f, slot, index)
     b:SetScript("OnEnter", OnEnter)
     b:SetScript("OnLeave", OnLeave)
     b:SetScript("PostClick", function(self, button, down)
-        if button == "RightButton" and not down then
+        if down then return end
+        if button == "RightButton" then
+            -- a second right-click on the same icon closes the menu again
             local me = ns.Group.members[ns.playerName]
             if me then ns.Menu.OpenTotems(self, me, self.slot) end
+        else
+            ns.Menu.Close()
         end
     end)
     return b
@@ -339,7 +350,8 @@ function HUD.Update()
             SetBorder(b, ORANGE, slowPulse)
             badge = ("|cffff9a3cx%d|r"):format(#st.overlap + 1)
             attention = true
-        elseif a and ns.inCombat and (st.remaining or 0) <= 5 then
+        elseif a and ns.inCombat and (a.duration or 0) > 15 and (st.remaining or 0) <= 5 then
+            -- short totems (Fire Nova, Mana Tide, Stoneclaw) would pulse their whole life
             SetBorder(b, YELLOW, pulse)
         elseif st.state == "offplan" then
             SetBorder(b, YELLOW, 0.55)

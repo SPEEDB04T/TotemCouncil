@@ -40,11 +40,23 @@ function ns.Safe(f, ...)
     return false
 end
 
+-- Error lines are capped per zone, so a later problem still gets reported.
+function ns.ResetErrors()
+    seenErrors, errorCount = {}, 0
+end
+
+local function PlayerDead()
+    if not UnitIsDeadOrGhost then return false end
+    local ok, dead = pcall(UnitIsDeadOrGhost, "player")
+    return ok and not issecret(dead) and dead and true or false
+end
+
 ----------------------------------------------------------------------
 -- The player's own totems
 -- ns.active[slot] = { key, spellID, name, rawName, icon, start, duration, castAt, src }
 ----------------------------------------------------------------------
 ns.active = {}
+ns.unknown = {}     -- [slot] = true: the game hides this slot and nothing has been seen in it yet
 ns.dirty = true
 
 local function SetActive(slot, entry)
@@ -58,6 +70,7 @@ function ns.ReadSlot(slot)
     if not GetTotemInfo then return false end
     local ok, have, name, start, dur, icon, _, spellID = pcall(GetTotemInfo, slot)
     if not ok or issecret(have) or issecret(name) or issecret(start) or issecret(dur) then return false end
+    ns.unknown[slot] = nil
     local now = GetTime()
     local cur = ns.active[slot]
     local up = have and type(name) == "string" and name ~= "" and type(start) == "number" and start > 0
@@ -92,6 +105,19 @@ function ns.ReadAllSlots()
     for slot = 1, 4 do ns.ReadSlot(slot) end
 end
 
+-- After a loading screen or a death the totems are gone. Readable slots say
+-- so themselves; in hidden slots the old timers would keep counting.
+local function ForgetTotems(afterLoading)
+    for slot = 1, 4 do
+        if ns.active[slot] then SetActive(slot, nil) end
+        if afterLoading then ns.unknown[slot] = true end
+    end
+    ns.ReadAllSlots()
+end
+
+-- Short or situational totems: dropping one should not make it the plan.
+local NO_ADOPT = { fn = true, sc = true, mt = true, eb = true, gr = true }
+
 -- The player's own cast is always visible, so it keeps the timers going in
 -- places where the totem slots themselves are hidden.
 local function OnPlayerCast(spellID)
@@ -103,12 +129,13 @@ local function OnPlayerCast(spellID)
     local slot = info and info.slot
     if not slot then return end
     local now = GetTime()
+    ns.unknown[slot] = nil
     SetActive(slot, {
         key = key, spellID = spellID,
         name = name or info.name, icon = icon or info.icon,
         start = now, duration = ns.Duration(key, spellID), src = "cast", castAt = now,
     })
-    if ns.db.autoAdopt and not ns.cdb.plan[slot] then ns.SetPlan(slot, key) end
+    if ns.db.autoAdopt and not ns.cdb.plan[slot] and not NO_ADOPT[key] then ns.SetPlan(slot, key) end
     C_Timer.After(0.3, function() ns.Safe(ns.ReadSlot, slot) end)
 end
 
@@ -144,6 +171,14 @@ function ns.SetPlan(slot, key)
     ns.Group.BroadcastState()
 end
 
+-- A planned totem is not down and it is worth saying so: not while dead, and
+-- not for a hidden slot nothing has been seen in yet (it may well be up).
+local function ShouldWarn(slot)
+    return ns.active[slot] == nil and ns.cdb.plan[slot] ~= nil
+        and (ns.inCombat or ns.db.warnAlways) and not ns.unknown[slot] and not ns.dead
+        and true or false
+end
+
 -- Everything the bar needs to draw one element.
 function ns.SlotStatus(slot)
     local a, plan = ns.active[slot], ns.cdb.plan[slot]
@@ -156,7 +191,7 @@ function ns.SlotStatus(slot)
     else
         st.state = "empty"
     end
-    st.warn = st.state == "missing" and (ns.inCombat or ns.db.warnAlways) or false
+    st.warn = ShouldWarn(slot)
     st.overlap = ns.Group.Overlaps(slot)
     st.conflict = ns.Group.PlanConflictsFor(slot)
     return st
@@ -171,8 +206,7 @@ local wasWarn, wasOverlap = {}, {}
 local function CheckAlerts()
     if not ns.isShaman then return end
     for slot = 1, 4 do
-        local a, plan = ns.active[slot], ns.cdb.plan[slot]
-        local warn = (not a) and plan ~= nil and (ns.inCombat or ns.db.warnAlways)
+        local warn = ShouldWarn(slot)
         if warn and not wasWarn[slot] then Ping() end
         wasWarn[slot] = warn
         local overlap = ns.Group.Overlaps(slot) ~= nil
@@ -203,11 +237,13 @@ local function Tick(_, elapsed)
         ns.Group.Tick(now)
         ns.dirty = true
     end
-    CheckAlerts()
-    ns.HUD.Update()
+    ns.dead = PlayerDead()
+    -- each step on its own, so a problem in one does not stop the others
+    ns.Safe(CheckAlerts)
+    ns.Safe(ns.HUD.Update)
     if ns.dirty then
         ns.dirty = false
-        ns.Board.Refresh()
+        ns.Safe(ns.Board.Refresh)
     end
 end
 
@@ -230,10 +266,15 @@ function events.UNIT_SPELLCAST_SUCCEEDED(unit, _, spellID)
 end
 
 function events.PLAYER_ENTERING_WORLD()
+    ns.ResetErrors()
     ns.inCombat = InCombatLockdown() and true or false
-    if ns.isShaman then ns.ReadAllSlots() end
-    ns.Group.Rebuild()
-    ns.HUD.ApplySecure()
+    if ns.isShaman then ns.Safe(ForgetTotems, true) end
+    ns.Safe(ns.Group.Rebuild)
+    ns.Safe(ns.HUD.ApplySecure)
+end
+
+function events.PLAYER_DEAD()
+    if ns.isShaman then ForgetTotems(false) end
 end
 
 function events.GROUP_ROSTER_UPDATE()
@@ -282,9 +323,10 @@ local function Init()
         if not ns.ValidKey(key, slot) then ns.cdb.plan[slot] = nil end
     end
 
-    ns.Group.Init()
-    ns.HUD.Create()
-    ns.Board.Create()
+    -- each part on its own, so one failing does not take the others with it
+    ns.Safe(ns.Group.Init)
+    ns.Safe(ns.HUD.Create)
+    ns.Safe(ns.Board.Create)
 
     for ev in pairs(events) do pcall(driver.RegisterEvent, driver, ev) end
     driver:SetScript("OnEvent", function(_, event, ...)
@@ -295,7 +337,7 @@ local function Init()
 
     if ns.isShaman and not ns.db.welcomed then
         ns.db.welcomed = true
-        ns.Print("drag the totem bar where you want it, then /totems lock. Right-click an icon to pick the totem you want kept up. /totems for more.")
+        ns.Print("drag the totem bar where you want it, then /totems lock. Right-click an icon to pick the totem you want kept up. /totems help for more.")
     end
 end
 
@@ -313,9 +355,9 @@ local function Help()
     ns.Print("  /totems  - show or hide the totem bar")
     ns.Print("  /totems plan  - open the group plan (who drops what, conflicts, sort it out)")
     ns.Print("  /totems lock | unlock | scale <0.5-2> | fade <0.1-1>")
-    ns.Print("  /totems click  - left-click casts the planned totem (" .. OnOff(ns.db.clickCast) .. ")")
+    ns.Print("  /totems click  - left-click drops the planned totem (" .. OnOff(ns.db.clickCast) .. ")")
     ns.Print("  /totems mouse  - bar reacts to the mouse (" .. OnOff(not ns.db.clickThrough) .. ")")
-    ns.Print("  /totems sound  - ping when a planned totem goes missing (" .. OnOff(ns.db.sound) .. ")")
+    ns.Print("  /totems sound  - ping when a planned totem goes missing or doubles up (" .. OnOff(ns.db.sound) .. ")")
     ns.Print("  /totems warn  - warn out of combat too (" .. OnOff(ns.db.warnAlways) .. ")")
     ns.Print("  /totems adopt  - empty plan slots adopt what you drop (" .. OnOff(ns.db.autoAdopt) .. ")")
     ns.Print("  /totems clear | status | demo | reset")
@@ -363,6 +405,7 @@ SlashCmdList.TOTEMCOUNCIL = function(msg)
         if InCombatLockdown() then ns.Print("can't show or hide the bar in combat.") return end
         db.shown = not db.shown
         ns.HUD.ApplySecure()
+        ns.Print(db.shown and "bar shown." or "bar hidden. /totems shows it again.")
     elseif cmd == "lock" or cmd == "unlock" then
         db.locked = (cmd == "lock")
         ns.Print(db.locked and "bar locked." or "bar unlocked: drag an icon to move it.")
@@ -388,10 +431,11 @@ SlashCmdList.TOTEMCOUNCIL = function(msg)
     elseif cmd == "mouse" then
         db.clickThrough = not db.clickThrough
         ns.HUD.ApplySecure()
-        ns.Print(db.clickThrough and "bar now ignores the mouse. /totems mouse to undo." or "bar reacts to the mouse again.")
+        ns.Print((db.clickThrough and "bar now ignores the mouse. /totems mouse to undo." or "bar reacts to the mouse again.")
+            .. (InCombatLockdown() and " (applies after combat)" or ""))
     elseif cmd == "sound" then
         db.sound = not db.sound
-        ns.Print("missing-totem ping " .. OnOff(db.sound))
+        ns.Print("totem ping (missing or doubled up) " .. OnOff(db.sound))
     elseif cmd == "warn" then
         db.warnAlways = not db.warnAlways
         ns.Print(db.warnAlways and "warning about missing totems in and out of combat." or "warning about missing totems in combat only.")
